@@ -1,0 +1,296 @@
+
+pipeline {
+    agent any
+    
+    environment {
+        AWS_DEFAULT_REGION = 'us-east-1'
+        ECR_REPOSITORY_FRONTEND = 'aquila-frontend'
+        ECR_REPOSITORY_BACKEND = 'aquila-backend'
+        IMAGE_TAG = "${BUILD_NUMBER}"
+        AWS_ACCOUNT_ID = credentials('aws-account-id')
+        MONGODB_URI = credentials('mongodb-uri')
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.GIT_COMMIT = sh(returnStdout: true, script: 'git rev-parse HEAD').trim()
+                    env.GIT_SHORT_COMMIT = env.GIT_COMMIT.take(7)
+                }
+            }
+        }
+        
+        stage('Validate Environment') {
+            steps {
+                script {
+                    sh '''
+                        echo "Validating environment variables..."
+                        if [ -z "$AWS_ACCOUNT_ID" ]; then
+                            echo "ERROR: AWS_ACCOUNT_ID not set"
+                            exit 1
+                        fi
+                        if [ -z "$MONGODB_URI" ]; then
+                            echo "ERROR: MONGODB_URI not set"
+                            exit 1
+                        fi
+                        echo "Environment validation passed"
+                    '''
+                }
+            }
+        }
+        
+        stage('Install Dependencies') {
+            parallel {
+                stage('Frontend Dependencies') {
+                    steps {
+                        dir('frontend') {
+                            sh 'npm ci'
+                        }
+                    }
+                }
+                stage('Backend Dependencies') {
+                    steps {
+                        dir('backend') {
+                            sh 'npm ci'
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Run Tests') {
+            parallel {
+                stage('Frontend Tests') {
+                    steps {
+                        dir('frontend') {
+                            sh 'npm run test -- --coverage --watchAll=false'
+                        }
+                        publishHTML([
+                            allowMissing: false,
+                            alwaysLinkToLastBuild: true,
+                            keepAll: true,
+                            reportDir: 'frontend/coverage/lcov-report',
+                            reportFiles: 'index.html',
+                            reportName: 'Frontend Coverage Report'
+                        ])
+                    }
+                }
+                stage('Backend Tests') {
+                    steps {
+                        dir('backend') {
+                            sh 'npm run test:coverage'
+                        }
+                        publishHTML([
+                            allowMissing: false,
+                            alwaysLinkToLastBuild: true,
+                            keepAll: true,
+                            reportDir: 'backend/coverage/lcov-report',
+                            reportFiles: 'index.html',
+                            reportName: 'Backend Coverage Report'
+                        ])
+                    }
+                }
+            }
+        }
+        
+        stage('Security Scan') {
+            parallel {
+                stage('Frontend Security') {
+                    steps {
+                        dir('frontend') {
+                            sh 'npm audit --audit-level moderate'
+                        }
+                    }
+                }
+                stage('Backend Security') {
+                    steps {
+                        dir('backend') {
+                            sh 'npm audit --audit-level moderate'
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Build Docker Images') {
+            parallel {
+                stage('Build Frontend') {
+                    steps {
+                        script {
+                            dir('frontend') {
+                                sh """
+                                    docker build -t ${ECR_REPOSITORY_FRONTEND}:${IMAGE_TAG} .
+                                    docker tag ${ECR_REPOSITORY_FRONTEND}:${IMAGE_TAG} ${ECR_REPOSITORY_FRONTEND}:latest
+                                """
+                            }
+                        }
+                    }
+                }
+                stage('Build Backend') {
+                    steps {
+                        script {
+                            dir('backend') {
+                                sh """
+                                    docker build -t ${ECR_REPOSITORY_BACKEND}:${IMAGE_TAG} .
+                                    docker tag ${ECR_REPOSITORY_BACKEND}:${IMAGE_TAG} ${ECR_REPOSITORY_BACKEND}:latest
+                                """
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Push to ECR') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch 'develop'
+                }
+            }
+            steps {
+                script {
+                    sh """
+                        # Login to ECR
+                        aws ecr get-login-password --region ${AWS_DEFAULT_REGION} | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com
+                        
+                        # Tag and push frontend image
+                        docker tag ${ECR_REPOSITORY_FRONTEND}:${IMAGE_TAG} ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${ECR_REPOSITORY_FRONTEND}:${IMAGE_TAG}
+                        docker tag ${ECR_REPOSITORY_FRONTEND}:latest ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${ECR_REPOSITORY_FRONTEND}:latest
+                        docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${ECR_REPOSITORY_FRONTEND}:${IMAGE_TAG}
+                        docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${ECR_REPOSITORY_FRONTEND}:latest
+                        
+                        # Tag and push backend image
+                        docker tag ${ECR_REPOSITORY_BACKEND}:${IMAGE_TAG} ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${ECR_REPOSITORY_BACKEND}:${IMAGE_TAG}
+                        docker tag ${ECR_REPOSITORY_BACKEND}:latest ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${ECR_REPOSITORY_BACKEND}:latest
+                        docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${ECR_REPOSITORY_BACKEND}:${IMAGE_TAG}
+                        docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${ECR_REPOSITORY_BACKEND}:latest
+                    """
+                }
+            }
+        }
+        
+        stage('Deploy to Staging') {
+            when {
+                branch 'develop'
+            }
+            steps {
+                script {
+                    sh """
+                        cd infrastructure/terraform
+                        terraform init
+                        terraform plan -var="environment=staging" -var="image_tag=${IMAGE_TAG}"
+                        terraform apply -auto-approve -var="environment=staging" -var="image_tag=${IMAGE_TAG}"
+                    """
+                }
+            }
+        }
+        
+        stage('Integration Tests') {
+            when {
+                branch 'develop'
+            }
+            steps {
+                script {
+                    sh """
+                        # Wait for deployment to be ready
+                        sleep 60
+                        
+                        # Run integration tests
+                        cd tests/integration
+                        npm install
+                        npm run test:staging
+                    """
+                }
+            }
+        }
+        
+        stage('Deploy to Production') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    input message: 'Deploy to Production?', ok: 'Deploy'
+                    sh """
+                        cd infrastructure/terraform
+                        terraform init
+                        terraform plan -var="environment=production" -var="image_tag=${IMAGE_TAG}"
+                        terraform apply -auto-approve -var="environment=production" -var="image_tag=${IMAGE_TAG}"
+                    """
+                }
+            }
+        }
+        
+        stage('Post-Deployment Validation') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch 'develop'
+                }
+            }
+            steps {
+                script {
+                    sh """
+                        # Health check
+                        sleep 60
+                        
+                        if [ "${BRANCH_NAME}" = "main" ]; then
+                            ENDPOINT="https://aquila-app.buildwithsushant.com"
+                        else
+                            ENDPOINT="https://staging.aquila-app.buildwithsushant.com"
+                        fi
+                        
+                        echo "Checking health endpoint: \$ENDPOINT/health"
+                        for i in {1..10}; do
+                            if curl -f "\$ENDPOINT/health"; then
+                                echo "Health check passed"
+                                break
+                            else
+                                echo "Health check failed, attempt \$i/10"
+                                sleep 30
+                            fi
+                        done
+                    """
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            cleanWs()
+            sh 'docker system prune -f'
+        }
+        
+        success {
+            script {
+                if (env.BRANCH_NAME == 'main') {
+                    slackSend(
+                        channel: '#deployments',
+                        color: 'good',
+                        message: "✅ Production deployment successful! Build: ${BUILD_NUMBER}, Commit: ${env.GIT_SHORT_COMMIT}"
+                    )
+                }
+            }
+        }
+        
+        failure {
+            slackSend(
+                channel: '#deployments',
+                color: 'danger',
+                message: "❌ Build failed! Job: ${JOB_NAME}, Build: ${BUILD_NUMBER}, Branch: ${env.BRANCH_NAME}"
+            )
+        }
+        
+        unstable {
+            slackSend(
+                channel: '#deployments',
+                color: 'warning',
+                message: "⚠️ Build unstable! Job: ${JOB_NAME}, Build: ${BUILD_NUMBER}, Branch: ${env.BRANCH_NAME}"
+            )
+        }
+    }
+}
